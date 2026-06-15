@@ -52,6 +52,20 @@ logger = logging.getLogger("worker.main")
 # Error classification helpers
 # ---------------------------------------------------------------------------
 
+def _is_past_date(date_str: str) -> bool:
+    """True if the booking date is before today (job can never succeed)."""
+    from datetime import date as _date, datetime as _dt
+    s = (date_str or "").strip()
+    if not s:
+        return False
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return _dt.strptime(s, fmt).date() < _date.today()
+        except ValueError:
+            continue
+    return False
+
+
 def _is_non_retryable(stage: str, error: str) -> bool:
     combined = f"{stage}\n{error}".lower()
     return any(
@@ -365,6 +379,26 @@ class RabbitMQWorker:
             job.task.task_id,
             delivery_attempt,
         )
+
+        # Drop past-date jobs immediately — they can never succeed.
+        # (Catches stale messages already sitting in RabbitMQ that bypass the
+        # master's sheet-sync filter.) Ack without retry, no proxy, no browser.
+        if _is_past_date(job.task.date):
+            logger.warning(
+                "Task %s has past booking date %s — dropping without retry",
+                job.task.task_id,
+                job.task.date,
+            )
+            self.result_publisher.publish_job_result(
+                self._build_failure(
+                    job=job,
+                    upstream_proxy="",
+                    delivery_attempt=delivery_attempt,
+                    failure_reason=f"Booking date {job.task.date} is in the past",
+                    stage="Expired",
+                )
+            )
+            return DeliveryDecision(ack=True)
 
         # Allocate proxy (prefer task-level proxy if already set)
         allocated_proxy = not bool(job.task.upstream_proxy)

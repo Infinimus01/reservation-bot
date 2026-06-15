@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -825,6 +826,177 @@ class BookingEngine:
         await page.wait_for_timeout(10_000)
 
     # ------------------------------------------------------------------
+    # Human-like interaction helpers (anti-bot — mimic a real user)
+    # ------------------------------------------------------------------
+
+    async def _human_pause(self, page: Page, lo: int = 120, hi: int = 360) -> None:
+        await page.wait_for_timeout(random.randint(lo, hi))
+
+    async def _human_move_to(self, page: Page, locator) -> bool:
+        """Move the mouse to a random point inside the element along a natural path."""
+        try:
+            box = await locator.bounding_box()
+            if not box:
+                return False
+            tx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            ty = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+            await page.mouse.move(tx, ty, steps=random.randint(8, 20))
+            return True
+        except Exception:
+            return False
+
+    async def _human_type_field(self, page: Page, name: str, value: str) -> str:
+        """
+        Fill one form field the way a person would: move mouse → click to focus →
+        clear → type character-by-character with jittered delays → blur.
+        Falls back to JS for hidden fields. Returns 'typed' | 'js' | 'missing'.
+        """
+        locator = page.locator(f'input[name="{name}"]').first
+        try:
+            if await locator.count() == 0:
+                return "missing"
+            visible = await locator.is_visible()
+            editable = await locator.is_editable()
+        except Exception:
+            visible = editable = False
+
+        if visible and editable:
+            await self._human_move_to(page, locator)
+            await self._human_pause(page, 80, 220)
+            try:
+                await locator.click()
+            except Exception:
+                try:
+                    await locator.focus()
+                except Exception:
+                    pass
+            await self._human_pause(page, 60, 180)
+            try:
+                await locator.fill("")  # clear any pre-filled value
+            except Exception:
+                pass
+            for ch in value:
+                await page.keyboard.type(ch)
+                await page.wait_for_timeout(random.randint(45, 140))
+                if random.random() < 0.07:  # occasional "thinking" pause
+                    await page.wait_for_timeout(random.randint(220, 520))
+            await self._human_pause(page, 120, 300)
+            try:
+                await locator.evaluate(
+                    "el => { el.dispatchEvent(new Event('change', {bubbles:true})); el.blur(); }"
+                )
+            except Exception:
+                pass
+            self._log(f"  typed {name} (human)", logging.INFO)
+            return "typed"
+
+        # Field present but not visible — set via JS so it is still POSTed
+        try:
+            await locator.evaluate(
+                "(el, v) => { el.value = v;"
+                " el.dispatchEvent(new Event('input',{bubbles:true}));"
+                " el.dispatchEvent(new Event('change',{bubbles:true})); }",
+                value,
+            )
+            self._log(f"  set {name} (hidden/js)", logging.INFO)
+            return "js"
+        except Exception:
+            return "missing"
+
+    async def _human_select_country(self, page: Page, country: str) -> None:
+        sel = page.locator('select[name="country"]').first
+        try:
+            if await sel.count() == 0:
+                return
+        except Exception:
+            return
+        code = await sel.evaluate(
+            """(el, wanted) => {
+                wanted = (wanted || '').toLowerCase().trim();
+                let code = el.value || 'US';
+                for (const opt of el.querySelectorAll('option')) {
+                    const t = (opt.textContent || '').toLowerCase().trim();
+                    if (!t || t === 'choose a country') continue;
+                    if (t === wanted || t.includes(wanted) || wanted.includes(t)) {
+                        code = opt.value; break;
+                    }
+                }
+                return code;
+            }""",
+            country,
+        )
+        await self._human_move_to(page, sel)
+        await self._human_pause(page, 120, 320)
+        try:
+            await sel.select_option(code)
+        except Exception:
+            try:
+                await sel.evaluate(
+                    "(el, v) => { el.value = v;"
+                    " el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                    code,
+                )
+            except Exception:
+                pass
+        self._log(f"  selected country={code}", logging.INFO)
+        await self._human_pause(page, 150, 360)
+
+    async def _ensure_form_fields(self, page: Page, fields: dict[str, str]) -> None:
+        """Guarantee required fields are present/non-empty for the POST (creates hidden ones)."""
+        await page.evaluate(
+            """(fields) => {
+                const form = document.querySelector('form') || document.forms[0];
+                if (!form) return;
+                for (const [name, val] of Object.entries(fields)) {
+                    let el = form.querySelector('[name="' + name + '"]');
+                    if (el) {
+                        if (!el.value) {
+                            el.value = val;
+                            el.dispatchEvent(new Event('input',{bubbles:true}));
+                            el.dispatchEvent(new Event('change',{bubbles:true}));
+                        }
+                    } else {
+                        el = document.createElement('input');
+                        el.type = 'hidden'; el.name = name; el.value = val;
+                        form.appendChild(el);
+                    }
+                }
+            }""",
+            fields,
+        )
+
+    async def _human_submit_form(self, page: Page) -> None:
+        """Click a real submit button if present (human), else fall back to form.submit()."""
+        btn = None
+        for sel in (
+            'form button[type="submit"]',
+            'form input[type="submit"]',
+            'button[type="submit"]',
+            'button.btn-primary',
+            'form button',
+        ):
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    btn = loc
+                    break
+            except Exception:
+                continue
+        try:
+            async with page.expect_navigation(
+                wait_until="domcontentloaded", timeout=FORM_TIMEOUT_MS
+            ):
+                if btn is not None:
+                    await self._human_move_to(page, btn)
+                    await self._human_pause(page, 160, 420)
+                    await btn.click()
+                else:
+                    await page.locator("form").evaluate("f => f.submit()")
+        except Exception as exc:
+            self._log(f"Personal details submit nav warning: {exc}", logging.WARNING)
+            await page.wait_for_timeout(10_000)
+
+    # ------------------------------------------------------------------
     # Step 3 — Personal details
     # ------------------------------------------------------------------
 
@@ -853,94 +1025,55 @@ class BookingEngine:
             )
 
         self._log(
-            f"Filling details: {self.first_name} {self.last_name} | "
+            f"Filling details (human mode): {self.first_name} {self.last_name} | "
             f"email={self.email} | phone={self.phone} | zip={self.zip_code}",
             logging.INFO,
         )
 
-        # Fill the existing personal-details form and submit it directly.
-        # Using the real page form avoids creating a synthetic POST that CF may block.
-        fill_result = await page.evaluate(
-            """({firstName, surname, emailAddress, emailAddressConfirm,
-                  phoneNumber, phoneNumberFull, zipcode, country}) => {
-                const form = document.querySelector('form') || document.forms[0];
-                if (!form) return {ok: false, reason: 'no form on page'};
+        # Settle + a little idle mouse movement before touching the form,
+        # the way a person orients on a new page.
+        await self._human_pause(page, 500, 1100)
+        try:
+            await page.mouse.move(
+                random.randint(220, 640), random.randint(160, 420),
+                steps=random.randint(8, 16),
+            )
+        except Exception:
+            pass
 
-                // Resolve country code from the dropdown
-                let countryCode = 'US';
-                const sel = form.querySelector('select[name="country"]');
-                if (sel) {
-                    const wanted = country.toLowerCase();
-                    for (const opt of sel.querySelectorAll('option')) {
-                        const t = (opt.textContent || '').toLowerCase().trim();
-                        if (!t || t === 'choose a country') continue;
-                        if (t === wanted || t.includes(wanted) || wanted.includes(t)) {
-                            countryCode = opt.value;
-                            break;
-                        }
-                    }
-                    sel.value = countryCode;
-                }
+        # Fill each field one at a time — real mouse move, click, char-by-char typing.
+        await self._human_type_field(page, "firstName", self.first_name)
+        await self._human_type_field(page, "surname", self.last_name)
+        await self._human_type_field(page, "emailAddress", self.email)
+        await self._human_type_field(page, "emailAddressConfirm", self.email)
 
-                const setField = (name, val) => {
-                    let el = form.querySelector('input[name="' + name + '"]');
-                    if (el) {
-                        el.value = val;
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                        el.dispatchEvent(new Event('change', {bubbles: true}));
-                        return true;
-                    }
-                    // Field not present on form — create hidden input so it's POSTed
-                    el = document.createElement('input');
-                    el.type = 'hidden'; el.name = name; el.value = val;
-                    form.appendChild(el);
-                    return false;
-                };
+        # Phone: type whichever phone input is visible; guarantee both POST values.
+        phone_typed = await self._human_type_field(page, "phoneNumber", self.phone)
+        if phone_typed == "missing":
+            await self._human_type_field(page, "phone-number", f"+44{self.phone}")
 
-                setField('firstName', firstName);
-                setField('surname', surname);
-                setField('emailAddress', emailAddress);
-                setField('emailAddressConfirm', emailAddressConfirm);
-                setField('phoneNumber', phoneNumber);
-                setField('phone-number', phoneNumberFull);
-                setField('zipcode', zipcode);
+        await self._human_type_field(page, "zipcode", self.zip_code)
 
-                const fields = Array.from(form.querySelectorAll('input,select')).map(
-                    el => el.name + '=' + (el.name.toLowerCase().includes('email') ? '***' : el.value)
-                );
-                return {ok: true, action: form.action, countryCode, fields};
-            }""",
+        # Country dropdown (human-ish: move → select)
+        await self._human_select_country(page, self.country)
+
+        # Guarantee required POST fields exist even if hidden / intl-tel-input.
+        await self._ensure_form_fields(
+            page,
             {
                 "firstName": self.first_name,
                 "surname": self.last_name,
                 "emailAddress": self.email,
                 "emailAddressConfirm": self.email,
                 "phoneNumber": self.phone,
-                "phoneNumberFull": f"+44{self.phone}",
+                "phone-number": f"+44{self.phone}",
                 "zipcode": self.zip_code,
-                "country": self.country,
             },
         )
 
-        if not fill_result.get("ok"):
-            raise PlaywrightBookingError(
-                f"Personal details form not found: {fill_result.get('reason')}"
-            )
-
-        self._log(
-            f"Details form ready | country={fill_result.get('countryCode')} "
-            f"action={fill_result.get('action')}",
-            logging.INFO,
-        )
-
-        try:
-            async with page.expect_navigation(
-                wait_until="domcontentloaded", timeout=FORM_TIMEOUT_MS
-            ):
-                await page.locator("form").evaluate("f => f.submit()")
-        except Exception as exc:
-            self._log(f"Personal details form nav warning: {exc}", logging.WARNING)
-            await page.wait_for_timeout(10_000)
+        # Brief review pause, then submit by clicking the real button.
+        await self._human_pause(page, 400, 900)
+        await self._human_submit_form(page)
 
         await page.wait_for_timeout(10_000)
 
