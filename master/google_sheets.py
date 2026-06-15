@@ -930,6 +930,28 @@ class GoogleSheetsTaskSource:
             )
             return None
 
+        # Skip rows whose booking date is in the past — they can never succeed.
+        date_str = mapped.get("date", "").strip()
+        if date_str:
+            try:
+                from datetime import date as _date
+                parsed_date = None
+                for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y"):
+                    try:
+                        parsed_date = _date.fromisoformat(date_str) if fmt == "%Y-%m-%d" else __import__("datetime").datetime.strptime(date_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                if parsed_date is not None and parsed_date < _date.today():
+                    logger.warning(
+                        "Skipping Google Sheets row %s; booking date %s is in the past",
+                        row_number,
+                        date_str,
+                    )
+                    return None
+            except Exception:
+                pass
+
         provided_task_id = mapped.get("task_id", "")
         task_id = provided_task_id or self._generated_task_id(row_number)
         generated_fields = _apply_generated_defaults(mapped, task_id)

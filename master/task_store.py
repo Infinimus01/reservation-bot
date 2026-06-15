@@ -371,6 +371,39 @@ class TaskStore:
         self.upsert_tasks([next_task])
         return self.get_task(task_id)
 
+    def expire_past_date_tasks(self) -> list[str]:
+        """Mark any pending/queued/failed task whose booking date has passed as failed."""
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        expired_ids: list[str] = []
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, date FROM tasks
+                WHERE status IN ('pending', 'queued', 'failed')
+                """
+            ).fetchall()
+            now_iso = datetime.utcnow().isoformat()
+            for row in rows:
+                task_date = str(row["date"]).strip().replace("/", "-")
+                try:
+                    if task_date < today_str:
+                        conn.execute(
+                            """
+                            UPDATE tasks
+                            SET status = 'failed',
+                                failure_reason = 'Booking date has passed',
+                                stage = 'Expired',
+                                last_updated = ?
+                            WHERE task_id = ?
+                            """,
+                            (now_iso, row["task_id"]),
+                        )
+                        expired_ids.append(row["task_id"])
+                except Exception:
+                    continue
+        return expired_ids
+
     def requeue_tasks_for_worker(
         self,
         worker_id: str,

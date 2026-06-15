@@ -52,6 +52,9 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 def startup() -> None:
     task_store.initialize()
+    expired = task_store.expire_past_date_tasks()
+    if expired:
+        logger.info("Expired %d past-date tasks on startup: %s", len(expired), expired)
     ensure_broker_ready(settings.rabbitmq)
     queue_dispatcher.refresh_task_source(force=True)
 
@@ -110,6 +113,9 @@ def trigger_availability(
     request: AvailabilityTriggerRequest,
 ) -> AvailabilityTriggerResult:
     task_source_summary = queue_dispatcher.refresh_task_source(force=True)
+    expired = task_store.expire_past_date_tasks()
+    if expired:
+        logger.info("Expired %d past-date tasks during trigger: %s", len(expired), expired)
     try:
         normalized_slots = resolve_trigger_slots(request)
     except ValueError as exc:
