@@ -20,11 +20,13 @@ import logging
 import os
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 import aiohttp
 from dotenv import load_dotenv
+from faker import Faker
 from playwright.async_api import async_playwright, Page
 
 from alias_manager import create_alias, _create_faker_email
@@ -398,11 +400,33 @@ def _is_slot_full(html: str) -> bool:
 
 
 def _is_confirmed(url: str, html: str) -> bool:
+    """
+    Strict confirmation check. Only reliable signals count — the site is a
+    'reservation' site whose ordinary pages contain words like 'thank' and
+    'your reservation', so loose markers cause false-positive 'completed'
+    bookings. A booking is confirmed only when the URL reaches the thank-you /
+    orderHash page, or the page text says it unambiguously.
+    """
+    u = url.lower()
+    if (
+        "thank-you" in u
+        or "thankyou" in u
+        or "thank_you" in u
+        or "orderhash" in u
+    ):
+        return True
     lowered = html.lower()
-    return (
-        "thank-you" in url.lower()
-        or "orderhash" in url.lower()
-        or any(m in lowered for m in CONFIRMATION_MARKERS)
+    return any(
+        m in lowered
+        for m in (
+            "reservation is confirmed",
+            "booking is confirmed",
+            "your reservation is confirmed",
+            "your booking is confirmed",
+            "thank you for your reservation",
+            "thank you for your booking",
+            "orderhash",
+        )
     )
 
 
@@ -1068,23 +1092,49 @@ class BookingEngine:
         # Country dropdown (human-ish: move → select)
         await self._human_select_country(page, self.country)
 
-        # Guarantee required POST fields exist even if hidden / intl-tel-input.
-        await self._ensure_form_fields(
-            page,
-            {
-                "firstName": self.first_name,
-                "surname": self.last_name,
-                "emailAddress": self.email,
-                "emailAddressConfirm": self.email,
-                "phoneNumber": self.phone,
-                "phone-number": f"+44{self.phone}",
-                "zipcode": self.zip_code,
-            },
+        # Brief review pause (human) before submitting.
+        await self._human_pause(page, 400, 900)
+
+        # Submit EXACTLY like the proven reference (booking_browser_lane.submit_details):
+        # an explicit POST to /payment with the resolved payload. The personal-details
+        # form's native submit button does NOT reliably navigate to /payment, which
+        # desyncs the whole donation→summary→payment sequence (Step 6 then runs on the
+        # wrong page with no Turnstile). Forcing the POST here keeps the flow aligned.
+        csrf_name, csrf_value = await _get_csrf(page)
+        if not csrf_name or not csrf_value:
+            raise CSRFMissingError("Personal details page: CSRF token missing")
+
+        country_code = await page.evaluate(
+            """(wanted) => {
+                wanted = (wanted || '').toLowerCase().trim();
+                const sel = document.querySelector('select[name="country"]');
+                if (!sel) return 'US';
+                for (const opt of sel.querySelectorAll('option')) {
+                    const t = (opt.textContent || '').toLowerCase().trim();
+                    if (!t || t === 'choose a country') continue;
+                    if (t === wanted || t.includes(wanted) || wanted.includes(t)) return opt.value;
+                }
+                return sel.value || 'US';
+            }""",
+            self.country,
         )
 
-        # Brief review pause, then submit by clicking the real button.
-        await self._human_pause(page, 400, 900)
-        await self._human_submit_form(page)
+        await _post_form(
+            page,
+            f"{BASE_URL}/en/reservationindividuelle/payment",
+            {
+                "csrf_name": csrf_name,
+                "csrf_value": csrf_value,
+                "firstName": self.first_name,
+                "surname": self.last_name,
+                "zipcode": self.zip_code,
+                "country": country_code,
+                "phoneNumber": self.phone,
+                "phone-number": f"+44{self.phone}",
+                "emailAddress": self.email,
+                "emailAddressConfirm": self.email,
+            },
+        )
 
         await page.wait_for_timeout(10_000)
 
@@ -1170,13 +1220,33 @@ class BookingEngine:
 
     async def _step6_complete(self, page: Page) -> None:
         await self._guard_block_with_solve(page, "final payment page")
+
+        # The T&C form + Turnstile widget render asynchronously after navigation.
+        # Reading the sitekey too early returns nothing → we'd fall back to a
+        # hardcoded key and solve a token the server rejects (bouncing the flow
+        # back to /donation). Poll up to ~24s for the widget / T&C to appear.
+        for _ in range(12):
+            ready = await page.evaluate(
+                """() => ({
+                    widget: !!document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="turnstile"]'),
+                    terms: !!document.querySelector('input[name="terms-and-conditions"]'),
+                })"""
+            )
+            if ready.get("widget") and ready.get("terms"):
+                break
+            await page.wait_for_timeout(2_000)
+
         html = await page.content()
         current_url = page.url
 
         if _is_order_limit(html):
             raise OrderLimitError("Order limit on final payment page")
 
-        if "terms-and-conditions" not in html and "cf-turnstile-response" not in html:
+        if (
+            "terms-and-conditions" not in html
+            and "cf-turnstile-response" not in html
+            and "data-sitekey" not in html
+        ):
             raise PlaywrightBookingError(
                 f"Final payment page has unexpected structure at {current_url}. "
                 f"HTML snippet: {html[:400]}"
@@ -1366,26 +1436,34 @@ async def run_instance_playwright(
 
     _stage("Initialising")
 
-    # ── Resolve / auto-generate personal details ──────────────────────
-    first = (user_details.firstName or "").strip()
-    last = (user_details.lastName or "").strip()
-    phone = (user_details.phone or "").strip()
-    zip_code = (user_details.zip or "").strip()
+    # ── Generate a FRESH, UNIQUE identity for EVERY attempt ───────────
+    # The site rejects a booking when the same name / phone / email has already
+    # been used — even by a previous failed or partial attempt — so a repeated
+    # identity ("same data, multiple accounts") is refused. We therefore IGNORE
+    # any name/phone/zip on the sheet and synthesise a brand-new identity on each
+    # attempt (including retries). Only the booking request itself
+    # (date / time / ticket_count) is taken from the task.
     country = (user_details.country or "").strip() or "United States Of America"
 
-    if not all([first, last, phone, zip_code]):
-        generated = generate_personal_details(task_id)
-        first = first or generated["firstName"]
-        last = last or generated["lastName"]
-        phone = phone or generated["phone"]
-        zip_code = zip_code or generated["zip"]
-        country = country or generated["country"]
-        _log(f"Auto-generated: {first} {last} | phone={phone} | zip={zip_code}")
+    # Per-attempt-unique seed → unique phone/zip; faker gives high-variety,
+    # realistic names (the built-in name pool is only ~144 combos and would
+    # collide quickly over a campaign).
+    attempt_seed = (
+        f"{task_id}|{instance_id}|{os.getpid()}|{time.time_ns()}|{random.getrandbits(64)}"
+    )
+    contact = generate_personal_details(attempt_seed)
+    try:
+        _fake = Faker()
+        first = _fake.first_name()
+        last = _fake.last_name()
+    except Exception:
+        first, last = contact["firstName"], contact["lastName"]
+    phone = contact["phone"]
+    zip_code = contact["zip"]
+    _log(f"Fresh identity (unique per attempt): {first} {last} | phone={phone} | zip={zip_code}")
 
-    # ── Resolve / generate email — ALWAYS fresh per attempt ──────────
-    # Notre-Dame rejects an email once it has been used for any booking (even partial).
-    # Using a fresh unique email every attempt prevents "email already used" rejections.
-    # We IGNORE the email from the sheet and always generate fresh.
+    # ── Generate email — ALWAYS fresh per attempt ─────────────────────
+    # Derived from the fresh name above, with random digits, so it is unique too.
     email_provider = os.getenv("WORKER_EMAIL_PROVIDER", "faker").strip() or "faker"
     _stage("Generating email")
     try:
