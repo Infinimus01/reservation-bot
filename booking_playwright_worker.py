@@ -723,30 +723,41 @@ class BookingEngine:
             f"(year={y}, js_month={js_month}, day={js_day})",
             logging.INFO,
         )
-        clicked = await page.evaluate(
-            """({year, month, day}) => {
-                const cells = document.querySelectorAll(
-                    'td[data-handler="selectDay"][data-month="' + month +
-                    '"][data-year="' + year + '"]'
-                );
-                for (const cell of cells) {
-                    const a = cell.querySelector('a');
-                    if (a && a.textContent.trim() === day) {
-                        a.click();
-                        return 'clicked day ' + day;
+        # The jQuery datepicker renders its day cells only after an availability
+        # XHR completes — poll for the target cell (up to ~24s) before giving up,
+        # so a slow proxy/render doesn't fall through to the weaker direct-POST path.
+        clicked = None
+        for _attempt in range(8):
+            clicked = await page.evaluate(
+                """({year, month, day}) => {
+                    const cells = document.querySelectorAll(
+                        'td[data-handler="selectDay"][data-month="' + month +
+                        '"][data-year="' + year + '"]'
+                    );
+                    for (const cell of cells) {
+                        const a = cell.querySelector('a');
+                        if (a && a.textContent.trim() === day) {
+                            a.click();
+                            return 'clicked day ' + day;
+                        }
                     }
-                }
-                return null;
-            }""",
-            {"year": y, "month": js_month, "day": js_day},
-        )
+                    return null;
+                }""",
+                {"year": y, "month": js_month, "day": js_day},
+            )
+            if clicked:
+                break
+            await page.wait_for_timeout(3_000)  # wait for datepicker XHR, retry
 
         if clicked:
-            self._log(f"Calendar date click OK: {clicked}", logging.INFO)
+            self._log(
+                f"Calendar date click OK: {clicked} (after {_attempt + 1} attempt(s))",
+                logging.INFO,
+            )
             await page.wait_for_timeout(3_000)   # let any UI update settle
         else:
             self._log(
-                f"Calendar date cell not found — will inject ticketDate directly",
+                "Calendar date cell not found after polling — will inject ticketDate directly",
                 logging.WARNING,
             )
 
@@ -1086,8 +1097,8 @@ class BookingEngine:
     # ------------------------------------------------------------------
 
     async def _step4_donation(self, page: Page) -> None:
+        await self._guard_block_with_solve(page, "donation page")
         html = await page.content()
-        self._guard_block(html, "donation page")
 
         if "/payment" not in page.url and "donation" not in html:
             raise PlaywrightBookingError(
@@ -1134,8 +1145,8 @@ class BookingEngine:
     # ------------------------------------------------------------------
 
     async def _step5_summary(self, page: Page) -> None:
+        await self._guard_block_with_solve(page, "summary page")
         html = await page.content()
-        self._guard_block(html, "summary page")
 
         if "csrf_name" not in html:
             raise CSRFMissingError(f"Summary page missing CSRF. URL: {page.url}")
@@ -1158,10 +1169,9 @@ class BookingEngine:
     # ------------------------------------------------------------------
 
     async def _step6_complete(self, page: Page) -> None:
+        await self._guard_block_with_solve(page, "final payment page")
         html = await page.content()
         current_url = page.url
-
-        self._guard_block(html, "final payment page")
 
         if _is_order_limit(html):
             raise OrderLimitError("Order limit on final payment page")
