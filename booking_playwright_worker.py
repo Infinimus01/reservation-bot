@@ -1290,16 +1290,29 @@ class BookingEngine:
             raise DataDomeBlockError(f"DataDome/CF block detected at: {context}")
 
     async def _guard_block_with_solve(self, page: Page, context: str) -> None:
-        """Check for DataDome and attempt to solve it before raising."""
+        """
+        Solve a *real* DataDome challenge before raising.
+
+        The site embeds DataDome's tracking script (and a benign
+        "enable javascript and cookies" noscript) on EVERY page, so the broad
+        marker set produces false positives on legitimate pages (e.g. the
+        summary page). A page is only genuinely blocked when it carries an
+        actual challenge: the captcha-delivery interstitial, the strict
+        challenge markers, or the JSON cookie-refresh payload. Benign boilerplate
+        is not a block — proceed.
+        """
         html = await page.content()
-        if not _is_datadome(html):
+        is_real_challenge = (
+            _contains(html, DATADOME_CHALLENGE_MARKERS)
+            or _is_datadome_cookie_refresh(html) is not None
+        )
+        if not is_real_challenge:
             return
-        self._log(f"DataDome detected at: {context} — attempting 2captcha solve", logging.WARNING)
+        self._log(f"DataDome challenge at: {context} — attempting solve", logging.WARNING)
         solved = await _solve_datadome_on_page(page, self.proxy_line, lambda m: self._log(m, logging.INFO))
         if solved:
             html = await page.content()
-            # After solving, check strictly — "datadome" appears on normal pages too.
-            # We pass if csrf_name is present (booking form loaded) or no strict challenge markers remain.
+            # Pass if the booking form re-appeared or no strict challenge markers remain.
             if "csrf_name" in html or not _contains(html, DATADOME_CHALLENGE_MARKERS):
                 self._log(f"DataDome cleared at: {context}", logging.INFO)
                 return
