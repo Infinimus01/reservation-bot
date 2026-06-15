@@ -1,0 +1,80 @@
+services:
+  worker-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      WORKER_ID: worker-a
+      WORKER_NAME: worker-a
+      WORKER_MAX_TASKS: 3
+      RABBITMQ_WORKER_PREFETCH_COUNT: 3
+    command: ["python", "-m", "worker.worker_main"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./proxies.txt:/app/proxies.txt:ro
+
+  worker-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      WORKER_ID: worker-b
+      WORKER_NAME: worker-b
+      WORKER_MAX_TASKS: 3
+      RABBITMQ_WORKER_PREFETCH_COUNT: 3
+    command: ["python", "-m", "worker.worker_main"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./proxies.txt:/app/proxies.txt:ro
+
+  worker-c:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      WORKER_ID: worker-c
+      WORKER_NAME: worker-c
+      WORKER_MAX_TASKS: 2
+      RABBITMQ_WORKER_PREFETCH_COUNT: 2
+    command: ["python", "-m", "worker.worker_main"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./proxies.txt:/app/proxies.txt:ro
+
+  worker-d:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      WORKER_ID: worker-d
+      WORKER_NAME: worker-d
+      WORKER_MAX_TASKS: 2
+      RABBITMQ_WORKER_PREFETCH_COUNT: 2
+    command: ["python", "-m", "worker.worker_main"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./proxies.txt:/app/proxies.txt:ro

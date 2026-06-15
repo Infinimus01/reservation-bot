@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyo
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment / secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+local_env.sh
+
+# Credentials
+service.json
+proxies.txt
+proxies.local.txt
+proxies.txt.bak.*
+proxy_lanes.csv
+proxy_lanes.csv.bak.*
+
+# Logs
+logs/
+*.log
+
+# Browser profiles (may contain session cookies / PII)
+browser_profiles/
+browser_profile_notredame/
+browser_profile*/
+
+# Availability run outputs
+availability_runs/
+
+# SQLite state databases
+*.db
+*.db-journal
+
+# Screenshots & HTML debug captures
+screenshots/
+local_debug/
+*.png
+*.html
+
+# Backup files
+*.bak.*
+EOF
+
+# Lock files (optional to track — exclude to avoid noise)
+uv.lock
+
+# Downloaded artefacts
+downloaded_tickets/
+downloaded_files/
+downloaded*/
+*.zip
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.claude/
