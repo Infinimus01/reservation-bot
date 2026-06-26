@@ -583,7 +583,7 @@ class BrowserAvailabilityChecker:
             if proxy:
                 launch_kwargs["proxy"] = proxy
 
-            profile_dir = Path(os.getenv("NDAME_BROWSER_PROFILE_DIR", "browser_profile_notredame"))
+            profile_dir = Path(os.getenv("NDAME_BROWSER_PROFILE_DIR", "/opt/selenium_bot/browser_profile_availability"))
             profile_dir.mkdir(parents=True, exist_ok=True)
             # Remove stale Chrome singleton lock left by a previously crashed process.
             for _lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
