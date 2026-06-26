@@ -585,6 +585,9 @@ class BrowserAvailabilityChecker:
 
             profile_dir = Path(os.getenv("NDAME_BROWSER_PROFILE_DIR", "browser_profile_notredame"))
             profile_dir.mkdir(parents=True, exist_ok=True)
+            # Remove stale Chrome singleton lock left by a previously crashed process.
+            for _lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                (profile_dir / _lock).unlink(missing_ok=True)
 
             context_kwargs: dict[str, Any] = {
                 "user_data_dir": str(profile_dir),
