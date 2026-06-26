@@ -83,6 +83,11 @@ def is_datadome_or_protection_page(html: str) -> bool:
         "api-js.datadome.co",
         'id="cmsg"',
         "var dd=",
+        # Cloudflare managed challenge / Turnstile
+        "Just a moment",
+        "challenges.cloudflare.com",
+        "Checking if the site connection is secure",
+        "cf-mitigated",
     ]
     return any(marker in html for marker in markers)
 
@@ -256,6 +261,73 @@ async def solve_datadome_if_needed(page: Page, context: BrowserContext, proxy_li
     except Exception as exc:
         logger.warning("Reload after 2captcha inject failed: %s", exc)
     return True
+
+def _flare_cookies_to_playwright(cookies: list[dict]) -> list[dict]:
+    """Convert FlareSolverr cookie dicts to the format Playwright's add_cookies() expects."""
+    same_site_map = {"strict": "Strict", "lax": "Lax", "none": "None"}
+    result = []
+    for c in cookies:
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if not name or value is None:
+            continue
+        pw: dict = {"name": name, "value": str(value)}
+        if c.get("domain"):
+            pw["domain"] = c["domain"]
+        pw["path"] = c.get("path") or "/"
+        expires = c.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0:
+            pw["expires"] = float(expires)
+        if c.get("httpOnly"):
+            pw["httpOnly"] = True
+        if c.get("secure"):
+            pw["secure"] = True
+        ss = same_site_map.get((c.get("sameSite") or "").lower())
+        if ss:
+            pw["sameSite"] = ss
+        result.append(pw)
+    return result
+
+
+async def bootstrap_cf_cookies_via_flaresolverr(
+    target_url: str,
+    proxy_line: str = "",
+    flaresolverr_url: str = "http://127.0.0.1:8191/v1",
+) -> tuple[list[dict], str]:
+    """GET target_url through FlareSolverr to solve Cloudflare, return (cookies, user_agent)."""
+    import aiohttp
+
+    payload: dict = {"cmd": "request.get", "url": target_url, "maxTimeout": 120000}
+    if proxy_line:
+        parts = proxy_line.split(":")
+        if len(parts) >= 4:
+            host, port, user = parts[0], parts[1], parts[2]
+            password = ":".join(parts[3:])
+            payload["proxy"] = {"url": f"http://{host}:{port}", "username": user, "password": password}
+
+    logger.info("Bootstrapping CF cookies via FlareSolverr (%s) for %s", flaresolverr_url, target_url)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(
+            flaresolverr_url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            data = await resp.json(content_type=None)
+
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr returned status={data.get('status')!r}: {data.get('message', data)}")
+
+    solution = data.get("solution", {})
+    cookies = solution.get("cookies", [])
+    user_agent = solution.get("userAgent", "")
+    logger.info(
+        "FlareSolverr bootstrap OK — %d cookie(s) %s, UA: %.80s",
+        len(cookies),
+        [c.get("name") for c in cookies],
+        user_agent,
+    )
+    return cookies, user_agent
+
 
 async def save_debug(page: Page, name: str) -> str:
     html = await page.content()
@@ -473,6 +545,29 @@ class BrowserAvailabilityChecker:
             f" using proxy {_proxy_display(proxy_line)}" if proxy_line else " without proxy",
         )
 
+        # ── Bootstrap Cloudflare clearance via FlareSolverr ──────────────────
+        # FlareSolverr's hardened Chromium passes CF bot checks; we use it once
+        # to get the cf_clearance cookie + matching UA, then inject both into the
+        # Playwright context so subsequent navigations skip the Turnstile challenge.
+        flare_cookies: list[dict] = []
+        flare_ua: str = ""
+        # Prefer FLARESOLVERR_URLS (comma-separated list); fall back to single URL or localhost
+        _flare_urls_raw = os.getenv("FLARESOLVERR_URLS", os.getenv("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1"))
+        flaresolverr_url = [u.strip() for u in _flare_urls_raw.split(",") if u.strip()][0]
+        try:
+            raw_cookies, flare_ua = await bootstrap_cf_cookies_via_flaresolverr(
+                RESERVATION_URL,
+                proxy_line=proxy_line,
+                flaresolverr_url=flaresolverr_url,
+            )
+            flare_cookies = _flare_cookies_to_playwright(raw_cookies)
+        except Exception as exc:
+            logger.warning(
+                "FlareSolverr CF bootstrap failed — proceeding without CF cookies (may hit Cloudflare): %s",
+                exc,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         async with async_playwright() as p:
             launch_kwargs: dict[str, Any] = {
                 "headless": not manual,
@@ -500,6 +595,9 @@ class BrowserAvailabilityChecker:
             }
             if proxy:
                 context_kwargs["proxy"] = proxy
+            # cf_clearance is bound to the UA that solved the challenge — must match
+            if flare_ua:
+                context_kwargs["user_agent"] = flare_ua
 
             browser_channel = os.getenv("NDAME_BROWSER_CHANNEL", "").strip()
             if browser_channel:
@@ -508,6 +606,15 @@ class BrowserAvailabilityChecker:
             logger.info("Using persistent browser profile: %s", profile_dir.resolve())
             context = await p.chromium.launch_persistent_context(**context_kwargs)
             browser = context.browser
+
+            # Inject FlareSolverr cookies before any navigation
+            if flare_cookies:
+                await context.add_cookies(flare_cookies)
+                logger.info(
+                    "Injected %d FlareSolverr cookie(s) into browser context: %s",
+                    len(flare_cookies),
+                    [c["name"] for c in flare_cookies],
+                )
 
             try:
                 page = await context.new_page()
@@ -614,17 +721,27 @@ class BrowserAvailabilityChecker:
                 available_by_date: dict[str, list[dict[str, Any]]] = {}
                 for date_str in available_dates:
                     slots = None
+                    ajax_failed = False
                     try:
                         payload = await fetch_timeslots_from_browser(page, calendar_html, date_str, proxy_line=proxy_line)
                         slots = extract_available_slots_from_response(payload)
                     except Exception as exc:
                         logger.warning("Timeslots XHR blocked for %s (%s) — using standard slot schedule", date_str, exc)
+                        ajax_failed = True
 
-                    if not slots:
-                        # Calendar shows date available but XHR is CF-WAF blocked.
-                        # Synthesize full day schedule so tasks can be dispatched.
+                    if ajax_failed:
+                        # AJAX completely failed (CF-blocked, network error, etc.) — synthesize
+                        # standard schedule as a best-effort fallback. Workers validate availability
+                        # in real time via their own timeslot AJAX call before booking.
                         slots = [{"time": t, "totalAvailable": 20, "active": True} for t in _STANDARD_SLOTS]
                         logger.info("Synthetic slots for %s: %d timeslots", date_str, len(slots))
+                    elif not slots:
+                        # AJAX succeeded but all slots are sold out — skip this date entirely.
+                        # Synthesizing here would flood the queue with bookings for genuinely
+                        # unavailable slots (real-time check at worker level still catches this,
+                        # but it wastes CF bandwidth and iProyal proxies).
+                        logger.info("All slots sold out for %s (AJAX succeeded, no available slots) — skipping", date_str)
+                        continue
 
                     available_by_date[date_str] = slots
                     logger.info("Availability confirmed for %s: %s", date_str, format_available_slots(slots))

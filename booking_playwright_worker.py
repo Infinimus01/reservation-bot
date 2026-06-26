@@ -55,6 +55,7 @@ if not logger.handlers:
 
 BASE_URL = "https://resa.notredamedeparis.fr"
 RESERVATION_URL = f"{BASE_URL}/en/reservationindividuelle/tickets"
+TIMESLOTS_URL = f"{BASE_URL}/script/timeslots"
 DEFAULT_PAYMENT_TURNSTILE_SITEKEY = "0x4AAAAAAA1IAg9Oedxa-RnI"
 
 # Browser profile base dir — each worker instance gets its own subdirectory
@@ -86,6 +87,9 @@ DATADOME_CHALLENGE_MARKERS = [
     "captcha-delivery.com",
     "slide right to secure",
     "verification required",
+    # Cloudflare Turnstile / managed challenge
+    "challenges.cloudflare.com",
+    "cf-mitigated",
 ]
 ORDER_LIMIT_MARKERS = [
     "maximum amount of orders", "orderlimitreached", "order limit reached",
@@ -228,6 +232,69 @@ def proxy_from_line(line: str) -> dict | None:
 def proxy_display(line: str) -> str:
     parts = line.split(":")
     return f"{parts[0]}:{parts[1]}:{parts[2]}:***" if len(parts) >= 4 else line
+
+
+def _flare_cookies_to_playwright(cookies: list[dict]) -> list[dict]:
+    """Convert FlareSolverr cookie dicts to the format Playwright's add_cookies() expects."""
+    same_site_map = {"strict": "Strict", "lax": "Lax", "none": "None"}
+    result = []
+    for c in cookies:
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if not name or value is None:
+            continue
+        pw: dict = {"name": name, "value": str(value)}
+        if c.get("domain"):
+            pw["domain"] = c["domain"]
+        pw["path"] = c.get("path") or "/"
+        expires = c.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0:
+            pw["expires"] = float(expires)
+        if c.get("httpOnly"):
+            pw["httpOnly"] = True
+        if c.get("secure"):
+            pw["secure"] = True
+        ss = same_site_map.get((c.get("sameSite") or "").lower())
+        if ss:
+            pw["sameSite"] = ss
+        result.append(pw)
+    return result
+
+
+async def _bootstrap_cf_cookies_via_flaresolverr(
+    target_url: str,
+    proxy_line: str = "",
+    flaresolverr_url: str = "http://127.0.0.1:8191/v1",
+) -> tuple[list[dict], str]:
+    """GET target_url through FlareSolverr to solve Cloudflare, return (cookies, user_agent)."""
+    payload: dict = {"cmd": "request.get", "url": target_url, "maxTimeout": 120000}
+    if proxy_line:
+        parts = proxy_line.split(":", 3)
+        if len(parts) >= 4:
+            host, port, user, password = parts
+            payload["proxy"] = {"url": f"http://{host}:{port}", "username": user, "password": password}
+
+    logger.info("CF bootstrap via FlareSolverr (%s) for %s", flaresolverr_url, target_url)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(
+            flaresolverr_url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=130),
+        ) as resp:
+            data = await resp.json(content_type=None)
+
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr status={data.get('status')!r}: {data.get('message', data)}")
+
+    solution = data.get("solution", {})
+    cookies = solution.get("cookies", [])
+    user_agent = solution.get("userAgent", "")
+    logger.info(
+        "FlareSolverr bootstrap OK — %d cookie(s) %s",
+        len(cookies),
+        [c.get("name") for c in cookies],
+    )
+    return cookies, user_agent
 
 
 # ---------------------------------------------------------------------------
@@ -623,21 +690,54 @@ class BookingEngine:
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
+        # Bootstrap Cloudflare clearance via FlareSolverr before launching Playwright.
+        # cf_clearance is bound to the UA that solved the challenge, so we carry both.
+        flare_cookies: list[dict] = []
+        flare_ua: str = ""
+        _flare_raw = os.getenv("FLARESOLVERR_URLS", os.getenv("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1"))
+        _flare_urls = [u.strip() for u in _flare_raw.split(",") if u.strip()]
+        flaresolverr_url = random.choice(_flare_urls)
+        try:
+            raw_cookies, flare_ua = await _bootstrap_cf_cookies_via_flaresolverr(
+                RESERVATION_URL,
+                proxy_line=self.proxy_line,
+                flaresolverr_url=flaresolverr_url,
+            )
+            # Only inject CF-bypass cookies — NOT GTPHPSESSID.
+            # FlareSolverr's PHP session has no booking state (it only did a GET);
+            # injecting it overwrites the fresh session Playwright would create,
+            # and the booking form won't appear on the personal-details page.
+            _CF_COOKIES = {"cf_clearance", "__cf_bm", "_cfuvid", "__cfwaitingroom_notredame", "datadome"}
+            flare_cookies = [c for c in _flare_cookies_to_playwright(raw_cookies)
+                             if c.get("name") in _CF_COOKIES]
+            self._log(f"CF bootstrap OK — {len(flare_cookies)} CF cookie(s) (GTPHPSESSID excluded)", logging.INFO)
+        except Exception as exc:
+            self._log(f"CF bootstrap failed — proceeding without: {exc}", logging.WARNING)
+
         async with async_playwright() as p:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                headless=True,
-                locale="en-US",
-                no_viewport=True,
-                proxy=proxy,
-                args=[
+            ctx_kwargs: dict = {
+                "user_data_dir": str(self.profile_dir),
+                "headless": True,
+                "locale": "en-US",
+                "no_viewport": True,
+                "proxy": proxy,
+                "args": [
                     "--window-size=1440,900",
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
-            )
+            }
+            if flare_ua:
+                ctx_kwargs["user_agent"] = flare_ua
+            context = await p.chromium.launch_persistent_context(**ctx_kwargs)
             try:
+                if flare_cookies:
+                    await context.add_cookies(flare_cookies)
+                    self._log(
+                        f"Injected {len(flare_cookies)} CF cookie(s): {[c['name'] for c in flare_cookies]}",
+                        logging.INFO,
+                    )
                 page = await context.new_page()
                 await self._run_flow(page)
             finally:
@@ -784,6 +884,90 @@ class BookingEngine:
                 "Calendar date cell not found after polling — will inject ticketDate directly",
                 logging.WARNING,
             )
+
+        # Call the timeslot AJAX to register the selection in the server session.
+        # booking_browser_lane.py does this explicitly; without it the server returns
+        # a blank personal-details page (no firstName form) because the session has
+        # no confirmed timeslot.
+        try:
+            product_id_js = await page.evaluate("""
+            () => {
+                const inp = document.querySelector('input[name^="ticketNumbers["]');
+                const m = (inp?.getAttribute('name') || 'ticketNumbers[411622]').match(/ticketNumbers\\[(\\d+)\\]/);
+                return m ? m[1] : '411622';
+            }
+            """)
+            from urllib.parse import urlencode as _urlencode
+            ts_body = _urlencode({
+                "tag": "notredame",
+                "eventId": "1",
+                "productEventId": "",
+                "ticketDate": self.date,
+                "ticketNumber": str(self.ticket_count),
+                f"ticketNumbers[{product_id_js}]": str(self.ticket_count),
+                "timeslotsGroup": "",
+                "streetname": "reservationindividuelle",
+            })
+            ts_result = await page.evaluate(
+                """
+                async ({url, body}) => {
+                    const res = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body,
+                        credentials: 'include'
+                    });
+                    return {status: res.status, text: await res.text()};
+                }
+                """,
+                {"url": TIMESLOTS_URL, "body": ts_body},
+            )
+            ts_text = ts_result.get("text", "")
+            try:
+                import json as _json
+                ts_data = _json.loads(ts_text)
+                ts_slots = ts_data.get("timeslots", {})
+                # Find the requested slot in the response
+                matched_slot = next(
+                    (info for info in ts_slots.values()
+                     if isinstance(info, dict) and info.get("time") == self.time),
+                    None,
+                )
+                if matched_slot:
+                    avail = int(matched_slot.get("totalAvailable") or 0)
+                    sold_out = bool(matched_slot.get("soldOut"))
+                    expired = bool(matched_slot.get("expired"))
+                    self._log(
+                        f"Timeslot AJAX: {self.date} {self.time} → available={avail}, soldOut={sold_out}, expired={expired}",
+                        logging.INFO,
+                    )
+                    if sold_out or expired or avail < self.ticket_count:
+                        avail_times = [v.get("time") for v in ts_slots.values()
+                                       if isinstance(v, dict) and v.get("active") and not v.get("soldOut") and not v.get("expired")]
+                        raise PlaywrightBookingError(
+                            f"Slot {self.date} {self.time} unavailable (soldOut={sold_out}, expired={expired}, totalAvailable={avail}). Active slots: {avail_times}"
+                        )
+                else:
+                    avail_times = [v.get("time") for v in ts_slots.values()
+                                   if isinstance(v, dict) and v.get("active") and not v.get("soldOut") and not v.get("expired")]
+                    self._log(
+                        f"Timeslot AJAX: {self.date} {self.time} NOT FOUND in response. Active slots: {avail_times}",
+                        logging.WARNING,
+                    )
+                    raise PlaywrightBookingError(
+                        f"Slot {self.date} {self.time} not found in timeslots response. Active slots: {avail_times}"
+                    )
+            except PlaywrightBookingError:
+                raise
+            except Exception as _parse_exc:
+                self._log(f"Timeslot AJAX: HTTP {ts_result.get('status')} | parse error: {_parse_exc} | body[0:300]: {ts_text[:300]}", logging.WARNING)
+        except PlaywrightBookingError:
+            raise
+        except Exception as exc:
+            self._log(f"Timeslot AJAX failed (non-fatal): {exc}", logging.WARNING)
 
         # Verify CSRF is present before form submission
         csrf_name, csrf_value = await _get_csrf(page)
@@ -1054,7 +1238,14 @@ class BookingEngine:
         html = await page.content()
 
         if "firstName" not in html and "emailAddress" not in html:
-            self._log(f"Personal details HTML[0:600]: {html[:600]}", logging.WARNING)
+            # Log a section that includes the body to see errors, not just the DOCTYPE
+            body_start = html.find("<body")
+            snippet = html[body_start:body_start + 2000] if body_start >= 0 else html[:2000]
+            self._log(f"Personal details body[0:2000]: {snippet}", logging.WARNING)
+            # Also log whether CF/DataDome markers are present
+            markers = [m for m in ["challenges.cloudflare.com", "datadome", "error", "session", "expire", "unavailable"] if m.lower() in html.lower()]
+            if markers:
+                self._log(f"Personal details HTML markers: {markers}", logging.WARNING)
             raise PlaywrightBookingError(
                 f"Personal details page not reached. URL: {page.url}"
             )
