@@ -297,7 +297,7 @@ async def bootstrap_cf_cookies_via_flaresolverr(
     """GET target_url through FlareSolverr to solve Cloudflare, return (cookies, user_agent)."""
     import aiohttp
 
-    payload: dict = {"cmd": "request.get", "url": target_url, "maxTimeout": 120000}
+    payload: dict = {"cmd": "request.get", "url": target_url, "maxTimeout": 45000}
     if proxy_line:
         parts = proxy_line.split(":")
         if len(parts) >= 4:
@@ -530,6 +530,22 @@ class BrowserAvailabilityChecker:
                     return result
                 raise
 
+        except RuntimeError as exc:
+            msg = str(exc)
+            # CF managed challenge blocked the browser — persistent profile will
+            # accumulate trust over time; log and continue rather than crashing.
+            if "did not expose form" in msg or "Tickets page" in msg:
+                logger.warning(
+                    "CF challenge blocked this scan cycle — persistent profile will retry next cycle: %s", msg
+                )
+                report["status"] = "cf-blocked"
+                report["error"] = {"type": "RuntimeError", "message": msg}
+                self._write_report(cycle_started_at, report)
+                return {"matched_tasks": 0, "cf_blocked": True}
+            report["status"] = "error"
+            report["error"] = {"type": type(exc).__name__, "message": msg}
+            self._write_report(cycle_started_at, report)
+            raise
         except Exception as exc:
             report["status"] = "error"
             report["error"] = {"type": type(exc).__name__, "message": str(exc)}
