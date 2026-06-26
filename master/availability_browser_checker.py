@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-from flare_bot import PROXIES_FILE, RESERVATION_URL, TIMESLOTS_URL, setup_logging
+from flare_bot import PROXIES_FILE, RESERVATION_URL, TIMESLOTS_URL, setup_logging, rotate_proxy_session
 from master.availability_checker import (
     DISCOVERY_TICKET_COUNT,
     AvailabilityTriggerClient,
@@ -537,7 +537,7 @@ class BrowserAvailabilityChecker:
             raise
 
     async def _scan(self, *, checked_at: str, manual: bool) -> Any:
-        proxy_line = load_first_proxy()
+        proxy_line = rotate_proxy_session(load_first_proxy())  # fresh session IP every scan
         proxy = playwright_proxy_from_line(proxy_line)
 
         logger.info(
