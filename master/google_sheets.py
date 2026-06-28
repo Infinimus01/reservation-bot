@@ -729,6 +729,7 @@ class GoogleSheetsTaskSource:
 
             metadata_payload = dict(task.metadata)
             metadata_payload["sheet_runtime_status_managed"] = True
+            metadata_payload["sheet_status"] = task.status
             resolved_email = task.email.strip()
             if not resolved_email:
                 metadata_email = metadata_payload.get("resolved_email")

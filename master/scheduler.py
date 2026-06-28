@@ -16,7 +16,14 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 
 from dotenv import load_dotenv
 
@@ -33,6 +40,9 @@ SERVICE_NAME = "ndame-availability"
 POLL_INTERVAL = 30
 PARIS_TZ = ZoneInfo("Europe/Paris")
 SCHEDULE_TAB = "Schedule"
+PREWARM_MINUTES_BEFORE = 5
+PREWARM_SESSIONS_FILE = Path("/opt/selenium_bot/prewarm_sessions.json")
+PREWARM_TARGET_URL = "https://www.notredame-de-paris.com/visites"
 
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
 CREDENTIALS_FILE = os.getenv(
@@ -97,6 +107,50 @@ def _stop():
     subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
 
 
+def _flaresolverr_urls() -> list[str]:
+    raw = os.getenv("FLARESOLVERR_URLS", "")
+    return [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+
+
+def _prewarm_one(flare_url: str) -> str:
+    """Create a FlareSolverr session and load the target URL. Returns session_id or ''."""
+    v1 = f"{flare_url}/v1"
+    r = _requests.post(v1, json={"cmd": "sessions.create"}, timeout=15)
+    r.raise_for_status()
+    sid = r.json().get("session", "")
+    if not sid:
+        return ""
+    _requests.post(
+        v1,
+        json={"cmd": "request.get", "url": PREWARM_TARGET_URL, "session": sid, "maxTimeout": 60000},
+        timeout=90,
+    )
+    return sid
+
+
+def _prewarm_all(flare_urls: list[str]) -> None:
+    if not _REQUESTS_OK:
+        logger.warning("requests library not available — skipping FlareSolverr pre-warm")
+        return
+    sessions: dict[str, str] = {}
+    for url in flare_urls:
+        try:
+            sid = _prewarm_one(url)
+            if sid:
+                sessions[url] = sid
+                logger.info("Pre-warmed FlareSolverr session %s at %s", sid, url)
+            else:
+                logger.warning("Pre-warm session create returned no ID for %s", url)
+        except Exception as exc:
+            logger.warning("Pre-warm failed for %s: %s", url, exc)
+    if sessions:
+        try:
+            PREWARM_SESSIONS_FILE.write_text(json.dumps(sessions))
+            logger.info("Wrote %d pre-warm session(s) to %s", len(sessions), PREWARM_SESSIONS_FILE)
+        except Exception as exc:
+            logger.warning("Could not write prewarm sessions file: %s", exc)
+
+
 def _parse_hm(t: str) -> tuple[int, int] | None:
     parts = t.strip().split(":")
     if len(parts) != 2:
@@ -115,6 +169,18 @@ def _date_matches(date_val: str, now: datetime) -> bool:
         return datetime.strptime(v, "%Y-%m-%d").date() == now.date()
     except ValueError:
         return False
+
+
+_prewarm_done: set[str] = set()
+
+
+def _prewarm_key(start: tuple[int, int], date_val: str) -> str:
+    return f"{date_val}@{start[0]:02d}:{start[1]:02d}"
+
+
+def _hm_sub5(h: int, m: int) -> tuple[int, int]:
+    total = h * 60 + m - PREWARM_MINUTES_BEFORE
+    return (total // 60) % 24, total % 60
 
 
 def _tick():
@@ -152,6 +218,21 @@ def _tick():
         in_window,
     )
 
+    # Pre-warm FlareSolverr sessions PREWARM_MINUTES_BEFORE before start
+    prewarm_hm = _hm_sub5(*start)
+    pkey = _prewarm_key(start, active_row.get("date", "daily"))
+    if prewarm_hm <= current_hm < start and pkey not in _prewarm_done and not running:
+        _prewarm_done.add(pkey)
+        flare_urls = _flaresolverr_urls()
+        if flare_urls:
+            logger.info(
+                "Pre-warming %d FlareSolverr instance(s) — %d min before start at %02d:%02d",
+                len(flare_urls), PREWARM_MINUTES_BEFORE, start[0], start[1],
+            )
+            _prewarm_all(flare_urls)
+        else:
+            logger.debug("No FLARESOLVERR_URLS set — skipping pre-warm")
+
     if in_window and not running:
         logger.info(
             "Schedule window %02d:%02d–%02d:%02d active, bot is stopped → starting",
@@ -164,6 +245,12 @@ def _tick():
             stop[0], stop[1],
         )
         _stop()
+        # Clean up pre-warmed sessions file after bot stops
+        if PREWARM_SESSIONS_FILE.exists():
+            try:
+                PREWARM_SESSIONS_FILE.unlink()
+            except Exception:
+                pass
 
 
 def main():

@@ -11,6 +11,7 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 import json
 import logging
+from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import urlencode
@@ -771,6 +772,9 @@ class AvailabilityChecker:
     async def _scan_availability(self) -> AvailabilityTriggerRequest:
         checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         previous_proxy = ""
+        # Force fresh proxy selection on every scan cycle so each cycle uses a different
+        # exit IP from the pool. Without this, _validated_proxy is reused indefinitely.
+        self._validated_proxy = ""
 
         for attempt in range(1, TIMESLOTS_403_RETRY_ATTEMPTS + 1):
             flare_url = self._next_flaresolverr_url()
@@ -811,6 +815,18 @@ class AvailabilityChecker:
             "Availability checker exhausted retry attempts without completing a scan"
         )
 
+    def _load_prewarm_session(self, flare_url: str) -> str:
+        prewarm_file = Path("/opt/selenium_bot/prewarm_sessions.json")
+        if not prewarm_file.exists():
+            return ""
+        try:
+            sessions: dict[str, str] = json.loads(prewarm_file.read_text())
+            sid = sessions.pop(flare_url, "")
+            prewarm_file.write_text(json.dumps(sessions))
+            return sid
+        except Exception:
+            return ""
+
     async def _scan_availability_once(
         self,
         *,
@@ -818,16 +834,19 @@ class AvailabilityChecker:
         upstream_proxy: str,
         checked_at: str,
     ) -> AvailabilityTriggerRequest:
+        prewarm_sid = self._load_prewarm_session(flare_url)
         session = FlareSession(
             flaresolverr_url=flare_url,
             upstream_proxy=upstream_proxy,
             instance_id=0,
+            session_id=prewarm_sid or None,
         )
 
         logger.info(
-            "Scanning availability via %s%s",
+            "Scanning availability via %s%s%s",
             flare_url,
             f" using proxy {_proxy_display(upstream_proxy)}" if upstream_proxy else "",
+            f" [pre-warmed session {prewarm_sid}]" if prewarm_sid else "",
         )
 
         try:

@@ -673,6 +673,7 @@ class BookingEngine:
         self.instance_id = instance_id
         self._log = log
         self._stage = stage_cb
+        self._confirmed_url: str = ""
 
     # ------------------------------------------------------------------
     # Public entry-point
@@ -1539,6 +1540,7 @@ class BookingEngine:
             )
 
         self._log(f"BOOKING CONFIRMED ✅  {final_url}", logging.INFO)
+        self._confirmed_url = final_url
 
     # ------------------------------------------------------------------
     # Guard helper — check for blocks on any page
@@ -1617,14 +1619,17 @@ async def run_instance_playwright(
         if status_callback:
             status_callback({"outcome": "running", "stage": label, "error": ""})
 
-    def _finish(outcome: str, stage: str, error: str = "") -> None:
+    def _finish(outcome: str, stage: str, error: str = "", extra: dict | None = None) -> None:
         _log(
             f"outcome={outcome} | stage={stage}"
             + (f" | error={error[:200]}" if error else ""),
             logging.INFO if outcome == "success" else logging.WARNING,
         )
         if status_callback:
-            status_callback({"outcome": outcome, "stage": stage, "error": error})
+            payload: dict = {"outcome": outcome, "stage": stage, "error": error}
+            if extra:
+                payload.update(extra)
+            status_callback(payload)
 
     _stage("Initialising")
 
@@ -1709,7 +1714,13 @@ async def run_instance_playwright(
 
     try:
         await engine.run()
-        _finish("success", "Completed")
+        extra: dict = {}
+        if engine._confirmed_url:
+            import re as _re
+            m = _re.search(r"[?&]orderhash=([^&#]+)", engine._confirmed_url, _re.IGNORECASE)
+            extra["booking_ref"] = m.group(1) if m else engine._confirmed_url
+            _log(f"Booking reference: {extra['booking_ref']}", logging.INFO)
+        _finish("success", "Completed", extra=extra)
 
     except OrderLimitError as exc:
         # Non-retryable — site hard limit, don't waste another attempt

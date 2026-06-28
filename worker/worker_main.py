@@ -247,6 +247,9 @@ def run_booking_job(
         "delivery_attempt": delivery_attempt,
         "instance_id": instance_id,
     }
+    booking_ref = str(terminal.get("booking_ref", "")).strip()
+    if booking_ref:
+        metadata["booking_ref"] = booking_ref
 
     if outcome == "success":
         return JobResultMessage(

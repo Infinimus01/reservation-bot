@@ -633,12 +633,13 @@ class FlareSession:
         upstream_proxy: str = "",
         max_timeout: int = DEFAULT_MAX_TIMEOUT,
         instance_id: int = 0,
+        session_id: str | None = None,
     ):
         self.flaresolverr_url = flaresolverr_url or _next_flaresolverr_url()
         self.upstream_proxy = upstream_proxy
         self.max_timeout = max_timeout
         self.instance_id = instance_id
-        self.session_id: str | None = None
+        self.session_id: str | None = session_id or None
         self._http: aiohttp.ClientSession | None = None
 
         # Last response data
@@ -726,7 +727,19 @@ class FlareSession:
     # ── Session lifecycle ─────────────────────────────────────────────
 
     async def create(self) -> str:
-        """Create a new FlareSolverr browser session."""
+        """Create a new FlareSolverr browser session (or reuse a pre-warmed one)."""
+        if self.session_id:
+            # Pre-warmed session provided — verify it's still alive before trusting it
+            try:
+                data = await self._request({"cmd": "sessions.list"})
+                if self.session_id in (data.get("sessions") or []):
+                    self._log(logging.INFO, f"Reusing pre-warmed session: {self.session_id}")
+                    return self.session_id
+            except Exception:
+                pass
+            self._log(logging.WARNING, f"Pre-warmed session {self.session_id} not found — creating fresh")
+            self.session_id = None
+
         payload: Dict[str, Any] = {"cmd": "sessions.create"}
         if self.upstream_proxy:
             payload["proxy"] = _parse_proxy(self.upstream_proxy)
