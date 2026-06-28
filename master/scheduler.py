@@ -1,0 +1,180 @@
+"""
+NDame Bot Scheduler
+Reads start/stop times from the "Schedule" tab in the Google Sheet and
+manages the ndame-availability systemd service accordingly.
+
+Sheet tab name: Schedule
+Headers (row 1): start_time | stop_time | date | enabled
+Example row:     11:45      | 12:30     | 2026-06-29 | true
+date can also be "daily" to repeat every day.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | scheduler | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ndame.scheduler")
+
+SERVICE_NAME = "ndame-availability"
+POLL_INTERVAL = 30
+PARIS_TZ = ZoneInfo("Europe/Paris")
+SCHEDULE_TAB = "Schedule"
+
+SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+CREDENTIALS_FILE = os.getenv(
+    "GOOGLE_SHEETS_CREDENTIALS_FILE",
+    "/opt/selenium_bot/service.json",
+)
+CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
+
+
+def _authorized_session():
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2.service_account import Credentials
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    if CREDENTIALS_FILE and os.path.exists(CREDENTIALS_FILE):
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    elif CREDENTIALS_JSON:
+        creds = Credentials.from_service_account_info(json.loads(CREDENTIALS_JSON), scopes=scopes)
+    else:
+        raise RuntimeError("No Google Sheets credentials found")
+    return AuthorizedSession(creds)
+
+
+def _read_schedule() -> list[dict[str, str]]:
+    if not SPREADSHEET_ID:
+        logger.warning("GOOGLE_SHEETS_SPREADSHEET_ID not set")
+        return []
+    try:
+        session = _authorized_session()
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
+            f"/values/{SCHEDULE_TAB}!A1:E50"
+        )
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        rows = resp.json().get("values", [])
+        if len(rows) < 2:
+            return []
+        headers = [h.strip().lower() for h in rows[0]]
+        result = []
+        for row in rows[1:]:
+            padded = row + [""] * max(0, len(headers) - len(row))
+            result.append(dict(zip(headers, padded)))
+        return result
+    except Exception as exc:
+        logger.warning("Failed to read Schedule tab: %s", exc)
+        return []
+
+
+def _service_active() -> bool:
+    r = subprocess.run(["systemctl", "is-active", SERVICE_NAME], capture_output=True, text=True)
+    return r.stdout.strip() == "active"
+
+
+def _start():
+    logger.info("START: running systemctl start %s", SERVICE_NAME)
+    subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
+
+
+def _stop():
+    logger.info("STOP: running systemctl stop %s", SERVICE_NAME)
+    subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
+
+
+def _parse_hm(t: str) -> tuple[int, int] | None:
+    parts = t.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _date_matches(date_val: str, now: datetime) -> bool:
+    v = date_val.strip().lower()
+    if v in ("daily", "everyday", "*", ""):
+        return True
+    try:
+        return datetime.strptime(v, "%Y-%m-%d").date() == now.date()
+    except ValueError:
+        return False
+
+
+def _tick():
+    now = datetime.now(tz=PARIS_TZ)
+    rows = _read_schedule()
+
+    active_row = None
+    for row in rows:
+        if row.get("enabled", "true").strip().lower() in ("false", "0", "no", "off"):
+            continue
+        if _date_matches(row.get("date", "daily"), now):
+            active_row = row
+            break
+
+    if not active_row:
+        logger.debug("No active schedule entry for today (%s)", now.strftime("%Y-%m-%d"))
+        return
+
+    start = _parse_hm(active_row.get("start_time", ""))
+    stop = _parse_hm(active_row.get("stop_time", ""))
+
+    if not start or not stop:
+        logger.warning("Invalid schedule row (bad start/stop time): %s", active_row)
+        return
+
+    current_hm = (now.hour, now.minute)
+    in_window = start <= current_hm < stop
+    running = _service_active()
+
+    logger.debug(
+        "Paris %02d:%02d | window %02d:%02d–%02d:%02d | bot=%s | in_window=%s",
+        now.hour, now.minute,
+        start[0], start[1], stop[0], stop[1],
+        "running" if running else "stopped",
+        in_window,
+    )
+
+    if in_window and not running:
+        logger.info(
+            "Schedule window %02d:%02d–%02d:%02d active, bot is stopped → starting",
+            start[0], start[1], stop[0], stop[1],
+        )
+        _start()
+    elif not in_window and running and current_hm >= stop:
+        logger.info(
+            "Schedule window ended at %02d:%02d, bot is running → stopping",
+            stop[0], stop[1],
+        )
+        _stop()
+
+
+def main():
+    logger.info("NDame scheduler started (poll every %ds, Paris timezone)", POLL_INTERVAL)
+    while True:
+        try:
+            _tick()
+        except Exception as exc:
+            logger.error("Unexpected scheduler error: %s", exc, exc_info=True)
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
