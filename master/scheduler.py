@@ -207,7 +207,11 @@ def _tick():
         return
 
     current_hm = (now.hour, now.minute)
-    in_window = start <= current_hm < stop
+    # Overnight window support: if stop < start the window crosses midnight
+    if stop < start:
+        in_window = current_hm >= start or current_hm < stop
+    else:
+        in_window = start <= current_hm < stop
     running = _service_active()
 
     logger.debug(
@@ -239,7 +243,7 @@ def _tick():
             start[0], start[1], stop[0], stop[1],
         )
         _start()
-    elif not in_window and running and current_hm >= stop:
+    elif not in_window and running:
         logger.info(
             "Schedule window ended at %02d:%02d, bot is running → stopping",
             stop[0], stop[1],
