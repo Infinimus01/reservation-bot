@@ -580,8 +580,20 @@ class GoogleSheetsTaskSource:
             if task is not None:
                 tasks.append(task)
             else:
-                date_str = row.get("date", "").strip()
-                if date_str and _is_past_date(date_str):
+                # Normalize raw headers to find "date" and "status" fields
+                date_str = ""
+                current_status = ""
+                for raw_key, raw_value in row.items():
+                    canonical = TASK_HEADER_ALIASES.get(_normalize_header(raw_key))
+                    if canonical == "date":
+                        date_str = str(raw_value).strip()
+                    elif canonical == "status":
+                        current_status = str(raw_value).strip().lower()
+                # Only expire rows that are pending/queued (or not yet touched).
+                # Never overwrite completed or already-failed rows.
+                if date_str and _is_past_date(date_str) and current_status not in (
+                    "completed", "failed", "expired"
+                ):
                     expired_row_numbers.append(row_number)
         return tasks, expired_row_numbers
 

@@ -372,7 +372,8 @@ class TaskStore:
         return self.get_task(task_id)
 
     def expire_past_date_tasks(self) -> list[str]:
-        """Mark any pending/queued/failed task whose booking date has passed as failed."""
+        """Mark pending/queued tasks whose booking date has passed as failed/Expired.
+        Never touches completed or already-failed tasks."""
         from datetime import date as _date
         today_str = _date.today().isoformat()
         expired_ids: list[str] = []
@@ -380,8 +381,7 @@ class TaskStore:
             rows = conn.execute(
                 """
                 SELECT task_id, date FROM tasks
-                WHERE status IN ('pending', 'queued', 'failed')
-                  AND (stage IS NULL OR stage != 'Expired')
+                WHERE status IN ('pending', 'queued')
                 """
             ).fetchall()
             now_iso = datetime.utcnow().isoformat()
