@@ -262,6 +262,117 @@ async def solve_datadome_if_needed(page: Page, context: BrowserContext, proxy_li
         logger.warning("Reload after 2captcha inject failed: %s", exc)
     return True
 
+async def solve_cf_turnstile_capsolver(page: Page) -> bool:
+    """Solve CF managed-challenge Turnstile via CapSolver. Returns True if solved."""
+    import aiohttp
+
+    api_key = os.getenv("CAPSOLVER_API_KEY", "").strip()
+    if not api_key:
+        logger.warning("CAPSOLVER_API_KEY not set — cannot auto-solve CF Turnstile")
+        return False
+
+    html = await page.content()
+    if "challenges.cloudflare.com" not in html and "cf-turnstile" not in html:
+        return False
+
+    # Sitekey lives in the live DOM (CF renders it via JS), not static HTML.
+    # Check data-sitekey attribute first, then CF's iframe URL pattern.
+    sitekey = await page.evaluate("""
+        () => {
+            const el = document.querySelector('[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            for (const iframe of document.querySelectorAll('iframe')) {
+                const src = iframe.src || iframe.getAttribute('src') || '';
+                const m1 = src.match(/turnstile\\/if\\/ov2\\/n2\\/([^\\/]+)/);
+                if (m1) return m1[1];
+                const m2 = src.match(/[?&]k=([^&]+)/);
+                if (m2) return m2[1];
+            }
+            const scripts = [...document.querySelectorAll('script')];
+            for (const s of scripts) {
+                const m = (s.textContent || '').match(/"sitekey"\\s*:\\s*"([^"]+)"/);
+                if (m) return m[1];
+            }
+            return null;
+        }
+    """)
+
+    if not sitekey:
+        logger.warning("CF Turnstile detected but sitekey not found in live DOM")
+        return False
+    page_url = page.url
+    logger.info("CF Turnstile detected (sitekey=%s…). Solving via CapSolver...", sitekey[:20])
+
+    payload = {
+        "clientKey": api_key,
+        "task": {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": sitekey,
+        },
+    }
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as http:
+        async with http.post("https://api.capsolver.com/createTask", json=payload) as resp:
+            create_data = await resp.json(content_type=None)
+
+        if create_data.get("errorId", 0) != 0:
+            logger.error("CapSolver createTask error: %s", create_data.get("errorDescription"))
+            return False
+
+        task_id = create_data.get("taskId", "")
+        if not task_id:
+            logger.error("CapSolver returned no taskId")
+            return False
+
+        logger.info("CapSolver CF Turnstile task created: %s. Polling...", task_id)
+
+        for _ in range(90):
+            await asyncio.sleep(2)
+            async with http.post(
+                "https://api.capsolver.com/getTaskResult",
+                json={"clientKey": api_key, "taskId": task_id},
+            ) as resp:
+                result = await resp.json(content_type=None)
+
+            status = result.get("status", "")
+            if status == "ready":
+                token = result.get("solution", {}).get("token", "")
+                if not token:
+                    logger.error("CapSolver ready but token is empty")
+                    return False
+                logger.info("CF Turnstile solved by CapSolver: %s…", token[:22])
+
+                injected = await page.evaluate("""
+                    (token) => {
+                        const inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                        if (inputs.length > 0) inputs[0].value = token;
+                        const form = document.querySelector('#challenge-form') || document.querySelector('form');
+                        if (form) { form.submit(); return true; }
+                        return false;
+                    }
+                """, token)
+
+                if injected:
+                    logger.info("CF Turnstile token injected — waiting for page redirect")
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(5000)
+                    return True
+
+                logger.warning("CF Turnstile token obtained but challenge form not found in page")
+                return False
+
+            if status == "failed":
+                logger.error("CapSolver task failed: %s", result.get("errorDescription"))
+                return False
+
+    logger.error("CapSolver CF Turnstile polling timed out")
+    return False
+
+
 def _flare_cookies_to_playwright(cookies: list[dict]) -> list[dict]:
     """Convert FlareSolverr cookie dicts to the format Playwright's add_cookies() expects."""
     same_site_map = {"strict": "Strict", "lax": "Lax", "none": "None"}
@@ -553,7 +664,18 @@ class BrowserAvailabilityChecker:
             raise
 
     async def _scan(self, *, checked_at: str, manual: bool) -> Any:
-        proxy_line = rotate_proxy_session(load_first_proxy())  # fresh session IP every scan
+        # In manual mode, reuse the same proxy session across runs so that the
+        # persistent profile's cf_clearance (bound to a specific exit IP) stays valid.
+        _session_file = Path(os.getenv("NDAME_BROWSER_PROFILE_DIR",
+                                        "/opt/selenium_bot/browser_profile_availability")) / ".local_proxy_session"
+        if manual and _session_file.exists():
+            proxy_line = _session_file.read_text().strip()
+            logger.info("Manual mode: reusing saved proxy session from %s", _session_file)
+        else:
+            proxy_line = rotate_proxy_session(load_first_proxy())
+            if manual and proxy_line:
+                _session_file.write_text(proxy_line)
+                logger.info("Manual mode: saved proxy session to %s", _session_file)
         proxy = playwright_proxy_from_line(proxy_line)
 
         logger.info(
@@ -644,10 +766,16 @@ class BrowserAvailabilityChecker:
                 await save_debug(page, "browser_01_tickets")
 
                 if is_datadome_or_protection_page(html) or "csrf_name" not in html:
-                    # Attempt 2captcha solving
-                    solved = await solve_datadome_if_needed(page, context, proxy_line)
-                    if solved:
+                    # Try CF Turnstile first (CapSolver)
+                    cf_solved = await solve_cf_turnstile_capsolver(page)
+                    if cf_solved:
                         html = await page.content()
+
+                    # Then try DataDome (2captcha) if still blocked
+                    if is_datadome_or_protection_page(html) or "csrf_name" not in html:
+                        solved = await solve_datadome_if_needed(page, context, proxy_line)
+                        if solved:
+                            html = await page.content()
 
                     if is_datadome_or_protection_page(html) or "csrf_name" not in html:
                         logger.info("Still protected/missing form at /tickets; refreshing once before manual prompt")

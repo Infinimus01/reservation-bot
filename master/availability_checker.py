@@ -515,12 +515,23 @@ def _proxy_url_from_upstream(proxy_value: str) -> str | None:
 
 class ReservationDirectSession:
     def __init__(self, flare_session: FlareSession):
-        self._http = requests.Session()
-        if flare_session.last_user_agent:
-            self._http.headers.update({"User-Agent": flare_session.last_user_agent})
-
         proxy_url = _proxy_url_from_upstream(flare_session.upstream_proxy)
-        if proxy_url:
+        cffi_proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
+        _use_cffi = False
+        try:
+            from curl_cffi import requests as _cffi_requests
+            # Proxy must go in the constructor — curl_cffi ignores .proxies.update()
+            self._http = _cffi_requests.Session(impersonate="chrome124", proxies=cffi_proxies)
+            _use_cffi = True
+        except ImportError:
+            self._http = requests.Session()
+
+        # Only set UA for plain requests — curl_cffi uses chrome124's native UA so
+        # TLS fingerprint and User-Agent stay consistent (CF checks both).
+        if not _use_cffi and flare_session.last_user_agent:
+            self._http.headers.update({"User-Agent": flare_session.last_user_agent})
+        if not _use_cffi and proxy_url:
             self._http.proxies.update({"http": proxy_url, "https": proxy_url})
 
         for cookie in flare_session.last_cookies:
@@ -722,6 +733,15 @@ class AvailabilityChecker:
                     sort_keys=True,
                 ),
             )
+            require_trigger = getattr(self.settings, "require_availability_trigger", True)
+            if not require_trigger:
+                logger.info("require_availability_trigger=false; skipping HTTP trigger")
+                report["status"] = "availability-found-no-trigger"
+                report["trigger_result"] = {"matched_tasks": 0, "normalized_availabilities": [], "updated_pending_tasks": 0}
+                report_path = self._write_cycle_report(cycle_started_at, report)
+                logger.info("Availability cycle report written to %s", report_path)
+                return {**report["trigger_result"], "report_file": str(report_path)}
+
             result = await self.client.trigger(request)
             logger.info(
                 "Triggered %d availability slot(s) across %d date(s); matched_tasks=%s updated_pending_tasks=%s",
@@ -815,29 +835,27 @@ class AvailabilityChecker:
             await session.get(RESERVATION_URL, timeout=TIMEOUT_NAVIGATION)
 
             initial_html = session.last_html or ""
-            if (
-                "csrf_name" not in initial_html
-                or "token_tickets" not in initial_html
-                or "api-js.datadome.co" in initial_html
-                or "datadome" in initial_html.lower()
-                or "Verification Required" in initial_html
-                or "Access is temporarily restricted" in initial_html
-                or 'id="cmsg"' in initial_html
-            ):
-                logger.info("DataDome detected on initial tickets load. Attempting to solve...")
+
+            def _is_blocked(html: str) -> bool:
+                # Form tokens missing → page didn't load (CF/DataDome/other block)
+                if "csrf_name" not in html or "token_tickets" not in html:
+                    return True
+                # Active DataDome block markers (NOT just the tracking script being present)
+                return (
+                    "Verification Required" in html
+                    or "Slide right to secure your access" in html
+                    or "Access is temporarily restricted" in html
+                    or 'id="cmsg"' in html
+                    or "var dd=" in html
+                )
+
+            if _is_blocked(initial_html):
+                logger.info("Page blocked on initial tickets load. Attempting DataDome solve...")
                 solved = await solve_datadome_in_session_if_needed(session, RESERVATION_URL, upstream_proxy)
                 if solved:
                     initial_html = session.last_html or ""
 
-                if (
-                    "csrf_name" not in initial_html
-                    or "token_tickets" not in initial_html
-                    or "api-js.datadome.co" in initial_html
-                    or "datadome" in initial_html.lower()
-                    or "Verification Required" in initial_html
-                    or "Access is temporarily restricted" in initial_html
-                    or 'id="cmsg"' in initial_html
-                ):
+                if _is_blocked(initial_html):
                     raise RuntimeError(
                         "FlareSolverr reached /tickets but Notre-Dame returned DataDome/protection page; "
                         "tickets form/tokens are missing"
@@ -858,7 +876,7 @@ class AvailabilityChecker:
             for date_str in available_dates:
                 try:
                     payload = await self._fetch_timeslots_payload(
-                        direct_session,
+                        session,
                         session.last_html or "",
                         date_str,
                     )
@@ -1038,7 +1056,7 @@ class AvailabilityChecker:
                 ticket_field_name: str(ticket_count),
             }
         )
-        await flare_session.post_direct_form(
+        await flare_session.post(
             f"{flare_session.last_url.rsplit('/', 1)[0]}/date",
             post_data=request_body,
             timeout=TIMEOUT_FORM_POST,
@@ -1049,7 +1067,7 @@ class AvailabilityChecker:
 
     async def _fetch_timeslots_payload(
         self,
-        direct_session: ReservationDirectSession,
+        flare_session: FlareSession,
         calendar_html: str,
         date_str: str,
     ) -> dict[str, Any]:
@@ -1066,23 +1084,30 @@ class AvailabilityChecker:
                 "streetname": "reservationindividuelle",
             }
         )
+        # Route through FlareSolverr's Chrome so CF WAF can't fingerprint Python HTTP.
+        # Chrome navigates to TIMESLOTS_URL and shows JSON in its viewer; we extract
+        # the raw JSON from the <pre> tag in the rendered page.
         headers = build_ajax_post_headers(f"{RESERVATION_URL.rsplit('/', 1)[0]}/date")
-        response = await asyncio.to_thread(
-            direct_session.post_form,
+        await flare_session.post(
             TIMESLOTS_URL,
-            request_body,
-            headers,
-            timeout_seconds=(TIMEOUT_FORM_POST / 1000) + 30,
+            post_data=request_body,
+            timeout=TIMEOUT_FORM_POST,
+            headers=headers,
         )
-        if response.status_code == 403:
+        html = flare_session.last_html or ""
+        # Chrome JSON viewer wraps content in <pre>; plain JSON responses also work.
+        soup = parse_html(html)
+        pre = soup.find("pre")
+        raw_json = pre.get_text(strip=True) if pre else html.strip()
+        # CF block check
+        if "Attention Required" in html or "Just a moment" in html:
+            logger.debug("Timeslots CF block body: %s", html[:300])
             raise TimeslotsForbiddenError(date_str)
-        if response.status_code >= 400:
-            raise RuntimeError(f"Timeslots request returned HTTP {response.status_code}")
         try:
-            return response.json()
+            return json.loads(raw_json)
         except ValueError as exc:
             raise RuntimeError(
-                f"Timeslots response was not JSON: {response.text[:300]}"
+                f"Timeslots response was not JSON: {raw_json[:300]}"
             ) from exc
 
     def _write_cycle_report(

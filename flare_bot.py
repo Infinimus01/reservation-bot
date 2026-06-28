@@ -830,17 +830,31 @@ class FlareSession:
         return FlareResponse.from_dict(data)
 
     def _build_direct_http_session(self) -> requests.Session:
-        http = requests.Session()
-        if self.last_user_agent:
-            http.headers.update({"User-Agent": self.last_user_agent})
-
+        proxy_url: str | None = None
         if self.upstream_proxy:
             parts = self.upstream_proxy.split(":")
             if len(parts) >= 4:
                 host, port, user = parts[0], parts[1], parts[2]
                 password = ":".join(parts[3:])
                 proxy_url = f"http://{user}:{password}@{host}:{port}"
-                http.proxies.update({"http": proxy_url, "https": proxy_url})
+
+        use_cffi = False
+        try:
+            from curl_cffi import requests as cffi_requests
+            # curl_cffi requires proxies + impersonate in the constructor; setting
+            # them after creation via .proxies.update() is ignored by the C backend.
+            cffi_proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+            http = cffi_requests.Session(impersonate="chrome124", proxies=cffi_proxies)
+            use_cffi = True
+        except ImportError:
+            http = requests.Session()
+        # Only set UA for plain requests.Session — curl_cffi must use its own
+        # Chrome 124 UA so TLS fingerprint and UA string stay consistent.
+        if not use_cffi and self.last_user_agent:
+            http.headers.update({"User-Agent": self.last_user_agent})
+
+        if proxy_url and not use_cffi:
+            http.proxies.update({"http": proxy_url, "https": proxy_url})
 
         for cookie in self.last_cookies:
             cookie_kwargs: dict[str, str] = {
@@ -856,26 +870,42 @@ class FlareSession:
 
     @staticmethod
     def _flare_cookies_from_requests_jar(
-        cookie_jar: requests.cookies.RequestsCookieJar,
+        cookie_jar,
     ) -> list[FlareCookie]:
         cookies: list[FlareCookie] = []
         for cookie in cookie_jar:
-            rest = getattr(cookie, "_rest", {}) or {}
-            same_site = str(
-                rest.get("SameSite") or rest.get("samesite") or "Lax"
-            )
-            cookies.append(
-                FlareCookie(
-                    name=str(cookie.name),
-                    value=str(cookie.value),
-                    domain=str(cookie.domain or ""),
-                    path=str(cookie.path or "/"),
-                    expiry=cookie.expires,
-                    http_only=("HttpOnly" in rest) or bool(rest.get("HttpOnly")),
-                    secure=bool(cookie.secure),
-                    same_site=same_site,
+            if isinstance(cookie, str):
+                # curl_cffi Cookies jar iterates over names (keys)
+                cookies.append(
+                    FlareCookie(
+                        name=cookie,
+                        value=str(cookie_jar[cookie]),
+                        domain="",
+                        path="/",
+                        expiry=None,
+                        http_only=False,
+                        secure=False,
+                        same_site="Lax",
+                    )
                 )
-            )
+            else:
+                # requests.Session cookie objects
+                rest = getattr(cookie, "_rest", {}) or {}
+                same_site = str(
+                    rest.get("SameSite") or rest.get("samesite") or "Lax"
+                )
+                cookies.append(
+                    FlareCookie(
+                        name=str(cookie.name),
+                        value=str(cookie.value),
+                        domain=str(cookie.domain or ""),
+                        path=str(cookie.path or "/"),
+                        expiry=cookie.expires,
+                        http_only=("HttpOnly" in rest) or bool(rest.get("HttpOnly")),
+                        secure=bool(cookie.secure),
+                        same_site=same_site,
+                    )
+                )
         return cookies
 
     async def post_direct_form(
