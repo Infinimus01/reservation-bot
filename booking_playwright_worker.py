@@ -1023,24 +1023,22 @@ class BookingEngine:
                 self._log(f"Calendar form nav warning: {exc}", logging.WARNING)
                 await page.wait_for_timeout(8_000)
         else:
-            # Date click didn't update form action (cell not found or click had no effect).
-            # Use a synthetic form posted directly to /personal-details — the same approach
-            # as booking_browser_lane.py which works reliably in the reference environment.
+            # Date click didn't update form action to /personal-details.
+            # Submit the form as-is to its current action (typically /date with token_tickets).
+            # The server needs this POST to set up the reservation session before it will
+            # serve the personal-details form — bypassing it causes error/expire on arrival.
             self._log(
-                f"Form action not /personal-details (got {form_action!r}) — "
-                "using _post_form directly to /personal-details",
+                f"Form action is {form_action!r} — submitting and following redirect",
                 logging.WARNING,
             )
-            await _post_form(
-                page,
-                f"{BASE_URL}/en/reservationindividuelle/personal-details",
-                {
-                    "csrf_name": csrf_name,
-                    "csrf_value": csrf_value,
-                    "ticketDate": self.date,
-                    "ticketTime": self.time,
-                },
-            )
+            try:
+                async with page.expect_navigation(
+                    wait_until="domcontentloaded", timeout=FORM_TIMEOUT_MS
+                ):
+                    await page.locator("form").evaluate("f => f.submit()")
+            except Exception as exc:
+                self._log(f"Calendar form nav warning: {exc}", logging.WARNING)
+                await page.wait_for_timeout(8_000)
 
         await page.wait_for_timeout(10_000)
 
@@ -1571,12 +1569,15 @@ class BookingEngine:
             return
         self._log(f"DataDome challenge at: {context} — attempting solve", logging.WARNING)
         solved = await _solve_datadome_on_page(page, self.proxy_line, lambda m: self._log(m, logging.INFO))
-        if solved:
-            html = await page.content()
-            # Pass if the booking form re-appeared or no strict challenge markers remain.
-            if "csrf_name" in html or not _contains(html, DATADOME_CHALLENGE_MARKERS):
+        html = await page.content()
+        # Pass if the booking form re-appeared or no strict challenge markers remain —
+        # covers both "solved=True and challenge gone" and "false positive with no real challenge".
+        if "csrf_name" in html or not _contains(html, DATADOME_CHALLENGE_MARKERS):
+            if solved:
                 self._log(f"DataDome cleared at: {context}", logging.INFO)
-                return
+            else:
+                self._log(f"DataDome false positive at: {context} — proceeding", logging.INFO)
+            return
         raise DataDomeBlockError(f"DataDome/CF block detected at: {context} (solve failed)")
 
 
