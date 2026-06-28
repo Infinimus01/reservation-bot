@@ -54,7 +54,14 @@ def startup() -> None:
     task_store.initialize()
     expired = task_store.expire_past_date_tasks()
     if expired:
-        logger.info("Expired %d past-date tasks on startup: %s", len(expired), expired)
+        logger.info("Expired %d past-date task(s) on startup: %s", len(expired), expired)
+        # Write expired status back to Google Sheet immediately on startup
+        expired_tasks = [t for t in task_store.list_tasks() if t.task_id in set(expired)]
+        if expired_tasks:
+            try:
+                google_sheets.write_task_runtime_states(expired_tasks)
+            except Exception:
+                logger.exception("Failed to write startup-expired task statuses to sheet")
     ensure_broker_ready(settings.rabbitmq)
     queue_dispatcher.refresh_task_source(force=True)
 

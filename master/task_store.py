@@ -381,6 +381,7 @@ class TaskStore:
                 """
                 SELECT task_id, date FROM tasks
                 WHERE status IN ('pending', 'queued', 'failed')
+                  AND (stage IS NULL OR stage != 'Expired')
                 """
             ).fetchall()
             now_iso = datetime.utcnow().isoformat()

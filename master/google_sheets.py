@@ -11,11 +11,27 @@ import time
 from typing import Any, Sequence
 from urllib.parse import quote
 
+from datetime import date as _date, datetime as _datetime
+
 import requests
 
 from master.task_store import TaskStore
 from shared.config import GoogleSheetsSettings
 from shared.models import BookingTask
+
+
+def _is_past_date(date_str: str) -> bool:
+    """Return True if date_str represents a date strictly before today."""
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            if fmt == "%Y-%m-%d":
+                parsed = _date.fromisoformat(date_str.strip())
+            else:
+                parsed = _datetime.strptime(date_str.strip(), fmt).date()
+            return parsed < _date.today()
+        except ValueError:
+            continue
+    return False
 
 
 logger = logging.getLogger("master.google_sheets")
@@ -394,9 +410,29 @@ class GoogleSheetsTaskSource:
 
             try:
                 rows = self._fetch_rows()
-                tasks = self._rows_to_tasks(rows)
+                tasks, expired_row_numbers = self._rows_to_tasks(rows)
                 synced_tasks = self.task_store.sync_external_tasks(tasks)
                 generated_defaults_written = self.write_generated_task_defaults(synced_tasks)
+
+                # Expire DB tasks whose date has now passed, then write back to sheet
+                newly_expired_ids = self.task_store.expire_past_date_tasks()
+                if newly_expired_ids:
+                    expired_db_tasks = [
+                        t for t in self.task_store.list_tasks()
+                        if t.task_id in set(newly_expired_ids)
+                    ]
+                    self.write_task_runtime_states(expired_db_tasks)
+                    logger.info(
+                        "Expired %d DB task(s) and wrote status back to sheet",
+                        len(newly_expired_ids),
+                    )
+
+                # Write expired status for sheet rows that were never loaded (past date at load time)
+                if expired_row_numbers:
+                    spreadsheet_id = self._active_spreadsheet_id()
+                    if spreadsheet_id:
+                        self.write_expired_row_statuses(spreadsheet_id, expired_row_numbers)
+
                 dispatchable_tasks = sum(
                     1 for task in synced_tasks if self.task_store.is_task_dispatchable(task)
                 )
@@ -405,6 +441,7 @@ class GoogleSheetsTaskSource:
                     "source": "google_sheets",
                     "fetched_rows": len(rows),
                     "synced_tasks": len(synced_tasks),
+                    "expired_rows": len(expired_row_numbers) + len(newly_expired_ids),
                     "dispatchable_tasks": dispatchable_tasks,
                     "generated_defaults_written": generated_defaults_written,
                     "spreadsheet_id": self._active_spreadsheet_id(),
@@ -535,13 +572,18 @@ class GoogleSheetsTaskSource:
             rows.append(mapped_row)
         return rows
 
-    def _rows_to_tasks(self, rows: list[dict[str, str]]) -> list[BookingTask]:
+    def _rows_to_tasks(self, rows: list[dict[str, str]]) -> tuple[list[BookingTask], list[int]]:
         tasks: list[BookingTask] = []
+        expired_row_numbers: list[int] = []
         for row_number, row in enumerate(rows, start=2):
             task = self._row_to_task(row_number=row_number, row=row)
             if task is not None:
                 tasks.append(task)
-        return tasks
+            else:
+                date_str = row.get("date", "").strip()
+                if date_str and _is_past_date(date_str):
+                    expired_row_numbers.append(row_number)
+        return tasks, expired_row_numbers
 
     def _ensure_spreadsheet_exists(self) -> None:
         if self.settings.csv_url or self._active_spreadsheet_id():
@@ -637,6 +679,38 @@ class GoogleSheetsTaskSource:
             )
 
         self._ensure_runtime_headers(spreadsheet_id)
+
+    def write_expired_row_statuses(self, spreadsheet_id: str, row_numbers: list[int]) -> int:
+        """Write 'failed / Expired' status to past-date rows that were never loaded into the DB."""
+        if not row_numbers or not spreadsheet_id:
+            return 0
+        header_map = self._ensure_runtime_headers(spreadsheet_id)
+        now_iso = _datetime.utcnow().isoformat()
+        data: list[dict[str, Any]] = []
+        for row_number in row_numbers:
+            for field_name, value in [
+                ("status", "failed"),
+                ("stage", "Expired"),
+                ("failure_reason", "Booking date has passed"),
+                ("last_updated", now_iso),
+            ]:
+                col = header_map.get(field_name)
+                if col is not None:
+                    data.append({
+                        "range": (
+                            f"{self._worksheet_name}!"
+                            f"{self._column_letters(col)}{row_number}"
+                        ),
+                        "majorDimension": "ROWS",
+                        "values": [[value]],
+                    })
+        self._batch_update_sheet_ranges(spreadsheet_id, data)
+        logger.info(
+            "Marked %d past-date row(s) as Expired in sheet (rows: %s)",
+            len(row_numbers),
+            row_numbers,
+        )
+        return len(row_numbers)
 
     def write_task_runtime_state(self, task: BookingTask) -> bool:
         return self.write_task_runtime_states([task]) > 0
