@@ -76,8 +76,24 @@ class TaskStore:
         if not task_list:
             return []
 
+        incoming_ids = {task.task_id for task in task_list}
         synced: list[BookingTask] = []
         with self._lock, self._connection() as conn:
+            # Remove pending/queued tasks from google_sheets source whose rows no
+            # longer exist in the sheet (deleted rows cause ID-shift orphans).
+            orphan_rows = conn.execute(
+                "SELECT task_id, metadata_json FROM tasks WHERE status IN ('pending', 'queued')"
+            ).fetchall()
+            for orphan in orphan_rows:
+                if orphan["task_id"] in incoming_ids:
+                    continue
+                try:
+                    meta = json.loads(orphan["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                if meta.get("source") == "google_sheets":
+                    conn.execute("DELETE FROM tasks WHERE task_id = ?", (orphan["task_id"],))
+
             for task in task_list:
                 existing_row = conn.execute(
                     "SELECT * FROM tasks WHERE task_id = ?",
@@ -535,6 +551,13 @@ class TaskStore:
         if existing is None:
             return incoming
 
+        # If row content changed significantly (row-shift after sheet deletion, or
+        # user overwrote the row with a different booking), treat as a fresh task.
+        if existing.status not in ("pending", "queued") and self._task_identity_changed(
+            existing, incoming
+        ):
+            return incoming
+
         merged_metadata = dict(existing.metadata)
         merged_metadata.update(incoming.metadata)
 
@@ -554,6 +577,17 @@ class TaskStore:
             )
 
         return existing.model_copy(update={"metadata": merged_metadata})
+
+    @staticmethod
+    def _task_identity_changed(existing: BookingTask, incoming: BookingTask) -> bool:
+        """True when the sheet row clearly represents a different booking than what's in DB."""
+        return (
+            existing.firstName != incoming.firstName
+            or existing.lastName != incoming.lastName
+            or existing.date != incoming.date
+            or existing.time != incoming.time
+            or existing.ticket_count != incoming.ticket_count
+        )
 
     @staticmethod
     def _dispatch_slot_changed(existing: BookingTask, incoming: BookingTask) -> bool:
