@@ -114,7 +114,8 @@ def _flaresolverr_urls() -> list[str]:
 
 def _prewarm_one(flare_url: str) -> str:
     """Create a FlareSolverr session and load the target URL. Returns session_id or ''."""
-    v1 = f"{flare_url}/v1"
+    base = flare_url.rstrip("/")
+    v1 = base if base.endswith("/v1") else f"{base}/v1"
     r = _requests.post(v1, json={"cmd": "sessions.create"}, timeout=15)
     r.raise_for_status()
     sid = r.json().get("session", "")
